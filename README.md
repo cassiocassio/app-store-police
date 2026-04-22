@@ -12,7 +12,9 @@ It answers one question:
 
 > **Will this submission be accepted, and if not, why will it be rejected?**
 
-It is **not** a UX or HIG reviewer. For taste and native feel, use a separate agent (e.g. a Gruber-style HIG reviewer). This one is about survival.
+It is **not** a UX or HIG reviewer. For taste and native feel — whether the app *feels* like a Mac app — use the sibling agent: **[what-would-gruber-say](https://github.com/cassiocassio/what-would-gruber-say)**. This one is about survival.
+
+The split is deliberate. UX problems that cause rejection (a hidden menu bar, a broken reserved shortcut, a non-compliant sandbox configuration) land on *both* agents' desks; taste problems that won't get you rejected (a slightly off-beat sidebar pattern, an idiosyncratic toolbar layout) are Gruber's lane only. Install both if you're shipping to the Mac App Store.
 
 ## When to use it
 
@@ -23,10 +25,15 @@ It is **not** a UX or HIG reviewer. For taste and native feel, use a separate ag
 
 ## Installation
 
-Drop `app-store-police.md` into either:
+Copy the agent into your project:
 
-- **Project-local**: `<your-repo>/.claude/agents/app-store-police.md` — shared with collaborators via git
-- **User-global**: `~/.claude/agents/app-store-police.md` — available in every project on your machine
+```bash
+mkdir -p .claude/agents
+curl -o .claude/agents/app-store-police.md \
+  https://raw.githubusercontent.com/cassiocassio/app-store-police/main/.claude/agents/app-store-police.md
+```
+
+Or drop it into `~/.claude/agents/` for every project on your machine.
 
 Then invoke it from Claude Code via the Task tool with `subagent_type: "app-store-police"`, or Claude will pick it up automatically when the task description matches.
 
