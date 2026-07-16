@@ -51,9 +51,11 @@ It will `WebFetch` the current App Store Review Guidelines rather than relying o
 
 ## Status
 
-Battle-tested taking a sandboxed Python-sidecar Mac app (Swift host + PyInstaller sidecar + bundled ffmpeg) through App Store Connect to internal TestFlight. The survival checklist and the appendix case study are drawn from that app's *actual* first-upload rejections and the fixes that cleared them — not from theory. Everything App-Store-Connect-specific (the three server-side rejections, the `ITMS-90296`/`90287` gates, the build-pipeline traps) is empirical.
+Battle-tested taking a sandboxed Python-sidecar Mac app (Swift host + PyInstaller sidecar + bundled ffmpeg) through App Store Connect to internal TestFlight. The survival checklist and the appendix case study are drawn from that app's *actual* first-upload rejections and the fixes that cleared them — not from theory. Everything App-Store-Connect-specific (the server-side rejections, the `ITMS-90296`/`90287` gates, the build-pipeline traps) is empirical.
 
-Expect the INDIE persona's war stories to drift as Apple's rules change — treat references (TN3125, Background Assets Framework, SMAppService, forum thread numbers) as starting points, not gospel. Pull requests welcome, especially for new rejection patterns and for non-PyInstaller sidecar toolchains (BeeWare/Briefcase, python-build-standalone, PythonKit).
+The signing/sandbox/manifest/§2.5.2 rules were then cross-checked against Apple's official docs and Apple DTS forum answers (a multi-source, adversarially-verified pass). Highlights folded in: the `itms-services` static-scan trap that auto-rejects bundled CPython 3.12+ (fix: `--with-app-store-compliance`); the `get-task-allow` auto-injection that crashes Debug nested helpers; library-validation requiring you to re-sign vendored wheels with *your* Team ID; the two distinct JIT entitlements (`allow-jit` MAP_JIT vs `allow-unsigned-executable-memory`) and why numba/llvmlite may need the broader one; and the 12 Feb 2025 privacy-manifest enforcement regime. Where a popular claim contradicts Apple's published text (e.g. "`inherit` + any other entitlement aborts the child" — it doesn't; only `get-task-allow` does), the agent now says so.
+
+Expect the INDIE persona's war stories to drift as Apple's rules change — treat references (technotes, forum thread numbers, the named-SDK list) as starting points, and re-fetch the live pages rather than trusting a snapshot. Pull requests welcome, especially for new rejection patterns and for non-PyInstaller sidecar toolchains (BeeWare/Briefcase, python-build-standalone, PythonKit).
 
 ## Licence
 
