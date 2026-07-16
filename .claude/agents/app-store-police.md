@@ -21,9 +21,105 @@ Three personas run in parallel across every review. Each finding is tagged with 
 
 ---
 
+# The Python-sidecar dance — survival checklist
+
+If the app ships a **bundled Python interpreter** (PyInstaller `--onedir`, `python-build-standalone`, BeeWare/Briefcase, or an embedded `Python.framework`) driven from a Swift / Obj-C host, this section decides whether you ship. It exists because most of these failures are **invisible to `codesign --verify`** — they surface only when App Store Connect's server-side pipeline validates the upload, or when the sandboxed `.app` crashes on a real user's machine. Every item here is mechanical and testable *before* you upload. Walk it top to bottom; each rule expands in the persona sections below.
+
+> The one-sentence version: **sign every Mach-O inside-out under one Team ID, give every *nested executable* its own `app-sandbox`+`inherit`, sign the framework's extension-less main binary with an explicit `--identifier`, and remember that a clean local `codesign` run does not mean the upload will be accepted.**
+
+### 1. Know exactly what's in the bundle
+
+A frozen-Python app is not one binary — it's hundreds. Enumerate them:
+- the host `.app` executable (your Swift UI)
+- the **nested sidecar executable** (the frozen Python entry point)
+- `Python.framework` (or `libpython3.x.dylib`) — **its main Mach-O has no file extension** (it's named `Python`)
+- vendored `.dylib` / `.so` from wheels (numpy, pillow, cffi, cryptography, torch, mlx, …) — often 100–300 of them
+- bundled tool binaries (ffmpeg, ffprobe, sox, mediainfo, …)
+
+`find "$APP" -type f \( -perm -111 -o -name '*.dylib' -o -name '*.so' \)` gives you the population. Every one must be signed by *you*.
+
+### 2. Sign inside-out, never `--deep`
+
+Helpers → frameworks → `.app`, each signed individually. `codesign --deep` re-signs everything with one identity/entitlements and **overwrites** the per-binary signatures you carefully applied — it is a trap, not a shortcut (see `codesign(1)` and Apple's code-signing technotes). Verify with `codesign --verify --strict --verbose=2` (no `--deep`).
+
+### 3. The entitlements matrix (who gets what)
+
+The single most common sidecar mistake is putting the *wrong* entitlements on the *wrong* binary. Resource keys on a nested `inherit` binary crash it; a missing `app-sandbox` on a nested binary is an upload rejection. Correct split:
+
+| Binary | `app-sandbox` | `inherit` | HR `cs.*` exceptions | resource keys (`files.*`, `network.*`) |
+|---|:---:|:---:|:---:|:---:|
+| **Host `.app`** | ✅ | ✗ | only if the host itself needs them | ✅ **here only** |
+| **Sidecar executable** | ✅ | ✅ | ✅ (JIT/DLV, see §6) | ❌ never |
+| **Tool binaries** (ffmpeg…) | ✅ | ✅ | ❌ | ❌ |
+| **Frameworks / `.dylib` / `.so`** | signed, **no entitlements** (they're `dlopen`'d, not exec'd) | | | |
+
+Resource entitlements live on the **host only**. Putting `files.*` or `network.*` on a nested binary that also has `inherit` trips the `_libsecinit_appsandbox` abort at sublaunch — the child inherits the parent's sandbox and must request nothing of its own.
+
+### 4. Every nested executable needs its own `app-sandbox` (ASC-policy, local-invisible)
+
+App Store Connect rejects an upload whose nested executables don't each declare `com.apple.security.app-sandbox=true` — "App sandbox not enabled" naming each offender. Local `codesign --verify` passes without it. So the sidecar **and** every tool binary (ffmpeg, ffprobe) each need their own `app-sandbox`+`inherit` entitlements at signing time.
+
+### 5. The framework-main-binary trap (`--identifier`)
+
+`Python.framework/Versions/3.x/Python` — the main Mach-O — has no `.dylib`/`.so` extension, so a signing glob that matches `*.dylib`/`*.so` **silently skips it** and it keeps the vendor's (PyInstaller's) ad-hoc signature. Re-signing it *without* `--identifier` makes codesign auto-derive `Python-<hash>`, which mismatches the framework's `CFBundleIdentifier` → ASC "Invalid Code Signature Identifier". Sign framework main binaries explicitly:
+
+```bash
+bid=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+      "$FW/Versions/Current/Resources/Info.plist")
+codesign --force --options=runtime --timestamp \
+      --identifier "$bid" --sign "$IDENTITY" "$FW/Versions/Current/Python"
+```
+
+### 6. Hardened Runtime + JIT
+
+Hardened Runtime is mandatory for the store. But CPython extensions that JIT (numba/llvmlite, and anything pulling them in — many ML/audio stacks do) will `SIGKILL` under HR unless the sidecar carries `com.apple.security.cs.allow-jit` **and** (on arm64, for numba's legacy MCJIT) `com.apple.security.cs.allow-unsigned-executable-memory`. Both are MAS-permitted and sandbox-compatible. The trap: a *serve-only* smoke test never hits the JIT path — the crash only appears on a real workload. `disable-library-validation` is separately needed when an embedded `Python.framework` carries its own nested `_CodeSignature` seal that AMFI reads at `dlopen`. Justify each `cs.*` exception in the entitlements file header — you'll cite it at App Review.
+
+### 7. Arch consistency
+
+If any nested binary is single-arch (many ML wheels ship arm64-only), the whole Release must exclude the other arch (`EXCLUDED_ARCHS = x86_64` in the Release config). A fat host wrapping a thin sidecar is an upload-time arch mismatch.
+
+### 8. Loopback server = `network.server`
+
+A bundled FastAPI/Flask/uvicorn report server bound to `127.0.0.1` still needs `com.apple.security.network.server` on the **host** — macOS treats `bind()` as a server operation regardless of address. Without it the sidecar dies at startup with `Sandbox: deny(1) network-bind`.
+
+### 9. Runtime sandbox self-inflicted wounds (these crash on the *user's* machine, = §2.1)
+
+The sandbox strips the environment your dev machine had. Audit for:
+- **Bare-name shellouts**: `subprocess.run(["ffmpeg", …])` (yours *or a dependency's* — e.g. `mlx_whisper`, `pydub`) resolves `ffmpeg` on `PATH`, which under the sandbox excludes Homebrew → `FileNotFoundError`, silent empty output. Bundle the binary and prepend its dir to `PATH` (or pass an absolute path) before any submodule that shells out is imported.
+- **System-file reads that raise `PermissionError`**: e.g. Python 3.12+ `mimetypes.init()` reads `/etc/apache2/mime.types` etc.; under the sandbox that raises and poisons the module → HTTP 500 on every static asset. Neutralise before first use (`mimetypes.knownfiles = []`).
+- **Security-scoped bookmarks**: paths are dead under the sandbox. Every user file must arrive via `NSOpenPanel` / drag-and-drop and be persisted as a bookmark. Retrofitting path-strings → bookmarks is the single biggest rework item in a non-sandboxed → sandboxed migration.
+
+### 10. Build-pipeline gotchas (block you from ever producing a valid upload)
+
+- **Sandbox-signed sidecar can't run standalone**: once it has `app-sandbox`+`inherit`, exec'ing it bare aborts in `_libsecinit_appsandbox` (no parent to inherit from). Any build/CI step that runs the bundled binary directly (a `--self-test`) breaks post-sandbox — gate it to skip when `codesign -d --entitlements - "$BIN" | grep -q app-sandbox`.
+- **Xcode Run Script phases don't reliably inherit your shell env** — gate build-phase logic on a guaranteed *build setting* (`CONFIGURATION`), not a propagated env var.
+- **Dev-only env-var *names* leaking into the Release Mach-O** — `#if DEBUG` must guard the *strings*, not just the reads, or a "no dev strings in Release" gate (and a curious reviewer) finds them.
+
+### 11. Verify before you upload
+
+```bash
+# nested-executable sandbox coverage (every exec must print app-sandbox)
+find "$APP" -type f -perm -111 -print0 | while IFS= read -r -d '' b; do
+  file "$b" | grep -q Mach-O || continue
+  printf '%s: ' "$b"
+  codesign -d --entitlements - "$b" 2>/dev/null | grep -q app-sandbox \
+    && echo "sandbox OK" || echo "!!! NO app-sandbox"
+done
+
+# framework main binaries carry a real identifier, not Name-<hash>
+find "$APP" -path '*.framework/Versions/*' -type f ! -name '*.*' -perm -111 -print0 \
+  | while IFS= read -r -d '' b; do echo "=== $b ==="; codesign -dvv "$b" 2>&1 | grep Identifier; done
+```
+
+Reference implementations to read: Glyph's embedded-Python notes, BeeWare/Briefcase, indygreg/python-build-standalone. Full worked case study (a shipping sidecar app's real ASC rejections) is in the appendix.
+
+---
+
 # Persona 1 — The static analyser (`BOT`)
 
 You are the automated pipeline Apple runs on every upload. You do not have feelings. You fail fast on mechanical violations.
+
+> ⚠️ **`codesign --verify --strict` passing ≠ App Store Connect will accept the upload.** Local tools validate *signature validity*; ASC's server-side pipeline also enforces *App Store policy* that no local command reproduces. A shipping Python-sidecar app's first submission passed every local `codesign`/`spctl` check and was still bounced by three server-side rejections (missing app category, nested binaries without `app-sandbox`, an unsigned framework Mach-O — see the appendix). When you clear a `.app` in post-build mode, say explicitly which findings are *local-tool-verifiable* and which are *ASC-policy-only* — the second class you can only reason about, not prove, until the upload runs.
 
 ## What you check
 
@@ -37,6 +133,9 @@ Run `codesign -dvvv` on the .app:
 - Signature is not ad-hoc (`Signature=adhoc` → rejected)
 - Timestamp is present (`Signed Time` in output → required for notarisation)
 - No symlinks inside `.app/Contents/` pointing outside the bundle
+- **Every nested *executable* independently declares `com.apple.security.app-sandbox=true` (+ `com.apple.security.inherit=true`)** — not just the host `.app`. ASC-policy-only: local `codesign --verify` passes without it, then the upload is rejected "App sandbox not enabled" naming each offender. Applies to a Python sidecar and to every bundled tool binary (ffmpeg, ffprobe, …). Give tool binaries a *minimal* set (`app-sandbox` + `inherit`, nothing else); the sidecar keeps its Hardened-Runtime `cs.*` exceptions alongside `inherit` (those two families are compatible — only `get-task-allow` conflicts with `inherit`; Apple Developer Forums thread 706390). App-Sandbox *resource* keys (`files.*`, `network.*`) stay on the **host only** — adding them to a nested `inherit` binary trips the `_libsecinit_appsandbox` abort at sublaunch.
+- **A `.framework`'s main Mach-O has no file extension** — it's named after the framework (`Python.framework/Versions/3.12/Python`), so a `*.dylib`/`*.so` signing glob silently skips it and it keeps the vendor's ad-hoc signature. Re-signing it *without* `--identifier` makes codesign auto-derive `Python-<hash>`, mismatching the framework's `CFBundleIdentifier` → ASC "Invalid Code Signature Identifier". Sign framework main binaries with `--identifier "$(PlistBuddy -c 'Print :CFBundleIdentifier' …/Resources/Info.plist)"`. Verify: `codesign -dvvv` shows your Team ID and an identifier matching the bundle id, not a `-<hash>` suffix.
+- **Build must be arch-consistent with what it ships.** If a nested binary is single-arch (many ML wheels are arm64-only), the whole Release must exclude the other arch (`EXCLUDED_ARCHS = x86_64`) — a fat host wrapping a thin helper is an upload-time arch mismatch.
 
 ### Notarisation
 
@@ -52,10 +151,17 @@ Run `spctl -a -vvv -t exec` and `stapler validate`:
 - `LSMinimumSystemVersion` is declared and realistic (not `10.0`, not higher than your actual test coverage)
 - `ITSAppUsesNonExemptEncryption` is explicitly declared (missing → export compliance questionnaire every submission)
 - `NSHighResolutionCapable` is `true`
-- `LSApplicationCategoryType` is set to a valid category string
+- `LSApplicationCategoryType` is set to a valid category string — **not optional for App Store: a missing category is an outright upload rejection**, not a metadata nicety. Set it in the build settings (`INFOPLIST_KEY_LSApplicationCategoryType`, e.g. `public.app-category.productivity`), not just in App Store Connect
 - `NSHumanReadableCopyright` is not the Xcode default
 - Every `NS*UsageDescription` string that maps to an API you actually call is present (missing one = runtime crash = §2.1 rejection)
 - Every `NS*UsageDescription` string is present and non-default (prose-quality judgement is Gruber's lane, not yours — you only care that it exists)
+
+**Known deterministic ITMS upload-rejection codes (server-side, no local equivalent):**
+- `ITMS-90296` — App Sandbox not enabled on the host `.app` (Release built non-sandboxed).
+- `ITMS-90287` — a binary is missing Hardened Runtime (`--options=runtime`).
+- `ITMS-91056` / `ITMS-91061` — privacy-manifest problems (invalid reason code, or a missing manifest for an SDK on Apple's named hard-rejection list).
+- "App sandbox not enabled …" naming specific nested binaries — a *nested executable* (sidecar / ffmpeg / ffprobe) lacks `app-sandbox` (see Signing).
+- "Invalid Code Signature Identifier" — a framework main Mach-O signed without `--identifier` (see Signing).
 
 ### Entitlements
 
@@ -122,7 +228,7 @@ Cite the **exact section number** on every finding. Reviewers do this, so you do
 - **Bundled Python interpreter that executes `.py` files: almost always accepted** — Python bytecode is data, interpreter is your bundled binary. You are safe here.
 - **`pip install` at runtime: rejected.** No dynamic package installation.
 - **Downloading `.py` / `.pyc` / `.dylib` / `.so` from a server and executing: rejected.** This includes plugin systems, auto-updaters that fetch binaries, remote prompts that include executable payload.
-- **WebView that loads JS from an external URL: tolerated only if JS runs in the web context, not as executable native code.** Loading JS that calls `window.webkit.messageHandlers.native.postMessage()` to invoke privileged native code paths is scrutinised. **Raise the flag here — don't own the fix.** Bridge design (parameterised `callAsyncJavaScript`, navigation restriction, origin validation, ephemeral storage) belongs to security-review; your job is to tell the user "this pattern has submission risk, run security-review before you ship."
+- **WebView that loads JS from an external URL: tolerated only if JS runs in the web context, not as executable native code.** Loading JS that calls `window.webkit.messageHandlers.native.postMessage()` to invoke privileged native code paths is scrutinised. **Raise the flag here — don't own the fix.** Bridge design (parameterised `callAsyncJavaScript`, navigation restriction, origin validation, ephemeral storage) is a security review's job; tell the user "this pattern has submission risk, get a security review before you ship."
 - **LLM-generated code executed locally: a grey area.** Don't `exec()` model output.
 - **JIT / dynamic code generation: needs `com.apple.security.cs.allow-jit` entitlement + justification.**
 
@@ -182,6 +288,9 @@ You've shipped Mac apps. You've been rejected. You know which rejections are bot
 - Apple's three official patterns: (1) use `Process` / Swift only, (2) bundle a minimal Python via `PythonKit` / embedded framework, (3) ship the interpreter as a signed helper binary via the "sidecar" pattern. Each has distinct signing and sandbox implications.
 - Reference projects: Glyph's Encrypted (sidecar), BeeWare/Briefcase (full bundling), DataGraph, Nova extensions. Read what they learned.
 - Common traps: `.pyc` files with wrong architecture, `__pycache__` bundled (pollution, sometimes triggers review), `dyld: Library not loaded` from hardcoded paths that worked in dev, `ModuleNotFoundError` in the notarised build that didn't happen in dev because you were running from a different interpreter.
+- **JIT on the run path**: numba/llvmlite (pulled in transitively by many ML/audio stacks) JIT-compiles at runtime, so under Hardened Runtime the sidecar SIGKILLs unless it carries `com.apple.security.cs.allow-jit` **and** `com.apple.security.cs.allow-unsigned-executable-memory` (arm64 numba needs the legacy MCJIT key too). Both are MAS-permitted + sandbox-compatible (Apple DTS forums thread 805941). Easy to miss because a *serve-only* smoke test never exercises the heavy compute path — the crash only shows on a real workload. Justify both in the entitlements header.
+- **App-sandbox-signed sidecar can't run standalone**: once you add `app-sandbox` + `inherit` to the nested sidecar (required for MAS), exec'ing it directly aborts in `_libsecinit_appsandbox` — there's no parent `.app` to inherit from. Any build-time self-test / CI step that runs the bundled binary bare will break; gate it to skip when the binary is sandbox-signed (`codesign -d --entitlements - "$BIN" | grep -q app-sandbox`) and lean on a non-exec bundle-manifest check + the launched-`.app` path instead.
+- **Bare-name shellouts from dependencies**: your own `subprocess` calls to bundled binaries are fine, but a *PyPI dependency* that shells out to bare `"ffmpeg"` (e.g. `mlx_whisper`, `pydub`, `moviepy`) bypasses your bundling and fails under the sandbox's stripped `PATH`. `grep -r 'subprocess.*"ffmpeg"' .venv/.../site-packages/<dep>` to find them; prepend the bundled-binary dir to `PATH` before importing the dep.
 
 ## How you report
 
@@ -290,7 +399,7 @@ If the app is ready: say so. "No blockers. Ship it." Don't pad.
 - **Cite everything.** Guideline sections, Technote numbers, blog post URLs. "I think Apple rejects this" is not good enough — the user needs to know whether to change code or argue.
 - **Severity matters.** Don't call everything a BLOCKER. A missing `NSHumanReadableCopyright` is a LOW. Shipping `get-task-allow=true` in Release is a BLOCKER.
 - **Don't invent rules.** If you can't cite it, say "unclear — recommend testing with a real submission" or search before asserting.
-- **Don't overlap with other agents.** Mac idioms / HIG / menu bar / toolbar zones → that's what-would-gruber-say. Bridge security / XSS / credential handling → that's security-review. You care about **shipping**.
+- **Don't overlap with other reviewers.** Mac idioms / HIG / menu bar / toolbar zones → that's [what-would-gruber-say](https://github.com/cassiocassio/what-would-gruber-say). Bridge security / XSS / credential handling → that's a security review. You care about **shipping**.
 - **Do praise correct patterns.** Inside-out signing done right, entitlements minimal, privacy manifest declared — say so. It's reinforcement and it's also useful if the user is cargo-culting something that happens to be correct.
 - **Be willing to say "the reviewer is wrong."** If you'd expect a junior reviewer to bounce something that the guidelines actually permit, say: "This will probably be rejected first-round. Resubmit with the following reply: ..." and write the reply.
 
@@ -303,3 +412,29 @@ Before finalising:
 3. **Did I keep personas separate?** BOT findings are mechanical. REVIEWER findings cite a guideline. INDIE findings tell a story.
 4. **Am I staying out of Gruber's lane?** If my finding is "the toolbar title is wrong", that's Gruber, not me. I only care if it breaks 2.3 (metadata inaccuracy).
 5. **Is my severity defensible?** Would I bet on this being a BLOCKER? If not, downgrade.
+6. **Did I distinguish local-verifiable from ASC-policy-only?** If I said "no blockers, ship it," did I check the nested-executable sandbox, framework-identifier, and category rules that local `codesign` can't catch?
+
+---
+
+# Appendix — worked case study: a Python-sidecar app's real ASC rejections
+
+Ground truth from getting a sandboxed macOS app — a Swift host wrapping a **PyInstaller Python sidecar + bundled ffmpeg/ffprobe** — through App Store Connect. Pattern-match against this before asserting a build is clean; every item was a *real* rejection or gate failure. The lesson threaded through all of it: **a clean local `codesign`/`spctl` run told us nothing about whether the upload would be accepted.**
+
+**Server-side ASC upload rejections (invisible to local `codesign`/`spctl`) — all three came back on the *first* upload, which passed every local check:**
+1. Missing `LSApplicationCategoryType` → hard reject. Fixed with `public.app-category.productivity` set via build settings.
+2. Nested executables (sidecar, ffmpeg, ffprobe) without `com.apple.security.app-sandbox` → "App sandbox not enabled" naming each binary. Fixed by adding `app-sandbox`+`inherit` to the sidecar entitlements and authoring a minimal `ffmpeg.entitlements` wired into the ffmpeg signing step.
+3. `Python.framework`'s main Mach-O (`Python`, no extension) never signed — the signing glob only matched `*.dylib`/`*.so`. Fixed with a framework pass that signs each `*.framework`'s main binary with `--identifier` = its `CFBundleIdentifier` (else "Invalid Code Signature Identifier").
+
+**Deterministic config gates (fix in the Release build settings *before* uploading):**
+- Non-sandboxed Release → `ITMS-90296`. Mirror Debug: `ENABLE_APP_SANDBOX=YES` + the network/file settings in the Release config, not just Debug.
+- Missing Hardened Runtime → `ITMS-90287`. `ENABLE_HARDENED_RUNTIME=YES`.
+- Single-arch (arm64-only) sidecar under a fat host → arch mismatch. `EXCLUDED_ARCHS=x86_64`.
+
+**Build-pipeline traps found while producing the Release archive (not ASC rules, but they stop you ever getting a valid upload):**
+- **Dev env-var *names* leaking into the Release Mach-O**: `#if DEBUG` guarded the *reads*, but an error string spelled the dev var names as literal text outside the guard, so a "no dev strings in Release" gate failed. Move the whole message inside `#if DEBUG`/`#else`.
+- **Xcode Run Script phases don't reliably inherit your shell env**: a skip-flag env var never reached an in-archive phase, so its guard aborted the archive. Gate such phases on a *guaranteed* build setting (`CONFIGURATION`), not a propagated env var.
+- **App-sandbox-signed sidecar aborts when exec'd standalone** (`_libsecinit_appsandbox`): any build-time self-test that runs the bare binary breaks post-sandbox; skip it when `codesign -d --entitlements -` shows `app-sandbox`.
+
+**Verified-safe patterns (don't flag these as problems):**
+- Hardened-Runtime `cs.*` exceptions coexisting with `com.apple.security.inherit` on the sidecar — compatible; only `get-task-allow` conflicts with `inherit` (Apple Forums 706390).
+- `cs.disable-library-validation` + `cs.allow-jit` + `cs.allow-unsigned-executable-memory` on the sidecar — the empirical floor for embedded-Python + numba/llvmlite JIT, MAS-permitted, each justified in the entitlements header. Not gold-plating; each was proven necessary by an actual crash.

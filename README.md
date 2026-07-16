@@ -16,6 +16,12 @@ It is **not** a UX or HIG reviewer. For taste and native feel — whether the ap
 
 The split is deliberate. UX problems that cause rejection (a hidden menu bar, a broken reserved shortcut, a non-compliant sandbox configuration) land on *both* agents' desks; taste problems that won't get you rejected (a slightly off-beat sidebar pattern, an idiosyncratic toolbar layout) are Gruber's lane only. Install both if you're shipping to the Mac App Store.
 
+## Shipping a bundled Python interpreter? Read this first
+
+If your Mac app wraps a **PyInstaller / python-build-standalone / BeeWare / embedded-`Python.framework` sidecar** driven from a Swift host, the agent opens with a dedicated **"Python-sidecar dance — survival checklist"**: the entitlements matrix (which binary gets `app-sandbox` vs `inherit` vs `cs.*` vs resource keys), the extension-less framework-binary signing trap, the JIT entitlements numba/llvmlite force under Hardened Runtime, the runtime sandbox wounds (bare-name `ffmpeg` shellouts, `mimetypes` `PermissionError`), and the verification commands.
+
+The hardest lesson it encodes: **a clean local `codesign --verify` run does not mean App Store Connect will accept the upload.** Nested-executable sandbox coverage, the framework `--identifier`, and the app category are all server-side-only rejections. The appendix is a worked case study of a real sidecar app's first-upload rejections (missing category, nested binaries without `app-sandbox`, an unsigned `Python` framework binary) and how each was fixed — plus the `ITMS-90296` / `ITMS-90287` config gates and the Xcode build-pipeline traps that stop you ever producing a valid upload.
+
 ## When to use it
 
 - Before a TestFlight or App Store submission
@@ -45,7 +51,9 @@ It will `WebFetch` the current App Store Review Guidelines rather than relying o
 
 ## Status
 
-Lightly battle-tested on one Python-sidecar Mac app in progress. Expect the INDIE persona's war stories to drift as Apple's rules change — treat references (TN3125, Background Assets Framework, SMAppService) as starting points, not gospel. Pull requests welcome, especially for new rejection patterns.
+Battle-tested taking a sandboxed Python-sidecar Mac app (Swift host + PyInstaller sidecar + bundled ffmpeg) through App Store Connect to internal TestFlight. The survival checklist and the appendix case study are drawn from that app's *actual* first-upload rejections and the fixes that cleared them — not from theory. Everything App-Store-Connect-specific (the three server-side rejections, the `ITMS-90296`/`90287` gates, the build-pipeline traps) is empirical.
+
+Expect the INDIE persona's war stories to drift as Apple's rules change — treat references (TN3125, Background Assets Framework, SMAppService, forum thread numbers) as starting points, not gospel. Pull requests welcome, especially for new rejection patterns and for non-PyInstaller sidecar toolchains (BeeWare/Briefcase, python-build-standalone, PythonKit).
 
 ## Licence
 
