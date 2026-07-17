@@ -49,11 +49,13 @@ The single most common sidecar mistake is putting the *wrong* entitlements on th
 | Binary | `app-sandbox` | `inherit` | HR `cs.*` exceptions | resource keys (`files.*`, `network.*`) |
 |---|:---:|:---:|:---:|:---:|
 | **Host `.app`** | ✅ | ✗ | only if the host itself needs them | ✅ **here only** |
-| **Sidecar executable** | ✅ | ✅ | ✅ (JIT/DLV, see §6) | ❌ never |
+| **Sidecar executable** | ✅ | ✅ | ⚠️ **only if its runtime forces them** (§6) — many sidecars need none | ❌ never |
 | **Tool binaries** (ffmpeg…) | ✅ | ✅ | ❌ | ❌ |
 | **Frameworks / `.dylib` / `.so`** | signed, **no entitlements** (they're `dlopen`'d, not exec'd) | | | |
 
 Resource entitlements live on the **host only**. Putting `files.*` or `network.*` on a nested binary that also has `inherit` trips the `_libsecinit_appsandbox` abort at sublaunch — the child inherits the parent's sandbox and must request nothing of its own.
+
+**The `cs.*` column is not a default — it's a last resort.** A sidecar that doesn't JIT and loads no vendor-sealed framework needs **zero** Hardened-Runtime exceptions, and that's the target. Every one you add weakens the runtime and buys you a justification to write at App Review. Add one only when a *real crash* proves you need it (§6), never pre-emptively because a checklist mentioned it.
 
 ### 4. Every nested executable needs its own `app-sandbox` (ASC-policy, local-invisible)
 
@@ -82,9 +84,11 @@ Apple recommends including **only one**. The trap: a *serve-only* smoke test nev
 
 If any nested binary is single-arch (many ML wheels ship arm64-only), the whole Release must exclude the other arch (`EXCLUDED_ARCHS = x86_64` in the Release config). A fat host wrapping a thin sidecar is an upload-time arch mismatch.
 
-### 8. Loopback server = `network.server`
+### 8. *If* your sidecar binds a socket: `network.server`
 
-A bundled FastAPI/Flask/uvicorn report server bound to `127.0.0.1` still needs `com.apple.security.network.server` on the **host** — macOS treats `bind()` as a server operation regardless of address. Without it the sidecar dies at startup with `Sandbox: deny(1) network-bind`.
+Skip this if it doesn't — plenty of sidecars just read stdin and write stdout, and need no network entitlement at all. But **if** the sidecar listens on a port — a local HTTP server (FastAPI / Flask / uvicorn), a ZeroMQ/gRPC channel, anything calling `bind()` — then **even on `127.0.0.1`** the **host** needs `com.apple.security.network.server`. macOS treats `bind()` as a server operation regardless of address, so "it's only loopback" buys you nothing. Without it the sidecar dies at startup with `Sandbox: deny(1) network-bind`.
+
+(Outbound-only traffic is a different key: `com.apple.security.network.client`. A sidecar that talks to a remote API but never listens needs `client`, not `server`. Grant neither if it does neither.)
 
 ### 9. Runtime sandbox self-inflicted wounds (these crash on the *user's* machine, = §2.1)
 
