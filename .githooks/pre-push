@@ -1,0 +1,65 @@
+#!/bin/sh
+# Pre-push leak gate for a public agent repo.
+#
+# This repo is a RELEASE cut from a working copy that lives inside a private
+# project. Project detail gets written into the agent while it is used for
+# real work; this gate stops that detail reaching a public push.
+#
+# Written after three real failures, all 3 Sep 2026:
+#   1. `grep -f <patternfile>` treats COMMENT lines as patterns — a file with
+#      '#' comments matched the literal '#' 136 times and reported 60+ bogus
+#      hits. A gate that cries wolf gets switched off. Comments are stripped.
+#   2. A case-sensitive scan missed an UPPERCASE env-var name carrying the
+#      product name. Everything here is -i.
+#   3. A first draft used `mapfile`, which is bash 4+. macOS ships bash 3.2,
+#      so it worked only where Homebrew bash was on PATH. This is now /bin/sh
+#      with no arrays, and uses `git grep` instead of building a file list.
+#
+# No bypass flag: `git push --no-verify` already exists if you truly mean it.
+
+set -eu
+
+die() { printf 'pre-push BLOCKED — %s\n' "$*" >&2; exit 1; }
+
+# Public-safe markers only. Do NOT add sensitive stems to this file — it is
+# public, and a list of what you consider secret is itself a disclosure.
+# Sensitive terms are read at runtime from the private file below.
+PUBLIC_PATTERNS='bristlenose
+trial-runs'
+
+PRIVATE_PATTERNS="${AGENT_LEAK_PATTERNS:-$HOME/.bristlenose-leak-patterns}"
+
+if [ -f "$PRIVATE_PATTERNS" ]; then
+  # strip comments and blank lines — the bug that made the old gate useless
+  EXTRA=$(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PRIVATE_PATTERNS")
+  printf 'leak gate: +%s private pattern(s)\n' "$(printf '%s\n' "$EXTRA" | grep -c . || true)" >&2
+else
+  EXTRA=''
+  printf 'leak gate: no private pattern file at %s — public markers only\n' "$PRIVATE_PATTERNS" >&2
+fi
+
+TRACKED=$(git ls-files | grep -c . || true)
+[ "$TRACKED" -gt 0 ] || die "no tracked files — refusing to push blind"
+
+FOUND=0
+# Patterns go through a temp file, not `for pat in $(...)`: word-splitting
+# would tear a multi-word pattern in half. A `while` in a PIPELINE would run
+# in a subshell and lose FOUND, so redirect from the file instead.
+PATFILE=$(mktemp)
+trap 'rm -f "$PATFILE"' EXIT INT TERM
+printf '%s\n' "$PUBLIC_PATTERNS" > "$PATFILE"
+[ -n "$EXTRA" ] && printf '%s\n' "$EXTRA" >> "$PATFILE"
+
+# NB: the hook excludes itself; it necessarily names the strings it screens for.
+while IFS= read -r pat; do
+  [ -n "$pat" ] || continue
+  if hits=$(git grep -I -n -i -F -e "$pat" -- ':!.githooks/' ':!LICENSE*' 2>/dev/null); then
+    FOUND=1
+    printf 'leak: %s\n' "$pat" >&2
+    printf '%s\n' "$hits" | head -5 | sed 's/^/    /' >&2
+  fi
+done < "$PATFILE"
+
+[ "$FOUND" -eq 0 ] || die "project content found above. Neutralise it, or route it to the project's own conventions doc, then push again."
+
+printf 'leak gate: clean (%s tracked files)\n' "$TRACKED" >&2

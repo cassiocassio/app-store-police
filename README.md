@@ -62,3 +62,23 @@ Expect the INDIE persona's war stories to drift as Apple's rules change — trea
 MIT. See [LICENSE](LICENSE).
 
 Copyright © 2026 Martin Storey.
+
+---
+
+## Releasing changes to this agent
+
+This repo is a **release** cut from a working copy that lives inside a private
+project, where the agent gets used on real work. That's what keeps it good — and
+it's also how project-specific detail ends up in the file.
+
+`.githooks/pre-push` is the gate that stops such detail reaching a public push.
+It is tracked, but git does not enable it automatically. **After cloning, run:**
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The gate screens tracked files case-insensitively and, if you keep a private
+pattern file, augments its list at runtime — that file is never committed, since
+publishing a list of terms you consider sensitive is itself a disclosure. Point
+it somewhere else with `AGENT_LEAK_PATTERNS=/path/to/file`.
